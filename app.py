@@ -3,16 +3,15 @@ import os
 import psycopg2
 from datetime import datetime
 
-# --- ASETUKSET (RETRO SUMMER TEEMA) ---
-# Haetaan tietokannan osoite Renderin asetuksista
+# --- ASETUKSET ---
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-# Väripaletti
-COLOR_BG = "#FAECB6"        # Vanilla (Tausta)
-COLOR_PRIMARY = "#2BBAA5"   # Keppel (Pääväri)
-COLOR_TEXT = "#333333"      # Tummanharmaa (Teksti)
-COLOR_CARD = "#FFFDF0"      # Korttiväri
-COLOR_DELETE = "#F96635"    # Giants orange (Poisto)
+# Värit
+COLOR_BG = "#FAECB6"
+COLOR_PRIMARY = "#2BBAA5"
+COLOR_TEXT = "#333333"
+COLOR_CARD = "#FFFDF0"
+COLOR_DELETE = "#F96635"
 
 CAT_COLORS = {
     "Työ": "#F96635",
@@ -25,7 +24,6 @@ CAT_COLORS = {
 def date_db_to_fi(db_date):
     try:
         if db_date:
-            # Postgres voi palauttaa päivämäärän date-objektina tai merkkijonona
             if isinstance(db_date, str):
                 parts = db_date.split("-")
                 if len(parts) == 3:
@@ -49,13 +47,15 @@ def date_fi_to_db(fi_date):
     return fi_date 
 
 class TaskManager:
-    def __init__(self):
-        # Yhdistetään Neon/Postgres-tietokantaan
-        self.conn = psycopg2.connect(DATABASE_URL, sslmode='require')
-        self.create_table()
+    # HUOM: Emme enää yhdistä __init__issä, jotta yhteys ei vanhene.
+    
+    def get_connection(self):
+        """Luo tuoreen yhteyden joka kerta kun sitä tarvitaan"""
+        if not DATABASE_URL:
+            raise Exception("DATABASE_URL puuttuu asetuksista")
+        return psycopg2.connect(DATABASE_URL, sslmode='require')
 
     def create_table(self):
-        # Postgres käyttää SERIAL eikä AUTOINCREMENT
         query = """
         CREATE TABLE IF NOT EXISTS tasks (
             id SERIAL PRIMARY KEY,
@@ -65,58 +65,76 @@ class TaskManager:
             completed BOOLEAN DEFAULT FALSE
         )
         """
-        with self.conn.cursor() as cur:
-            cur.execute(query)
-            self.conn.commit()
+        conn = None
+        try:
+            conn = self.get_connection()
+            with conn.cursor() as cur:
+                cur.execute(query)
+            conn.commit()
+        except Exception as e:
+            print("Virhe taulun luonnissa:", e)
+        finally:
+            if conn: conn.close()
 
     def add_task(self, content, category, deadline):
         db_date = date_fi_to_db(deadline)
-        # Postgres käyttää %s merkintää
         query = "INSERT INTO tasks (content, category, deadline) VALUES (%s, %s, %s)"
-        with self.conn.cursor() as cur:
-            cur.execute(query, (content, category, db_date))
-            self.conn.commit()
+        conn = self.get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(query, (content, category, db_date))
+            conn.commit()
+        finally:
+            conn.close()
 
     def update_task(self, task_id, content, category, deadline):
         db_date = date_fi_to_db(deadline)
         query = "UPDATE tasks SET content=%s, category=%s, deadline=%s WHERE id=%s"
-        with self.conn.cursor() as cur:
-            cur.execute(query, (content, category, db_date, task_id))
-            self.conn.commit()
+        conn = self.get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(query, (content, category, db_date, task_id))
+            conn.commit()
+        finally:
+            conn.close()
 
     def get_tasks(self, category_filter=None):
         query = "SELECT id, content, category, deadline, completed FROM tasks ORDER BY deadline ASC"
-        with self.conn.cursor() as cur:
-            cur.execute(query)
-            all_tasks = cur.fetchall()
-        
-        if category_filter and category_filter != "Kaikki":
-            return [t for t in all_tasks if t[2] == category_filter]
-        return all_tasks
+        conn = self.get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(query)
+                all_tasks = cur.fetchall()
+            
+            if category_filter and category_filter != "Kaikki":
+                return [t for t in all_tasks if t[2] == category_filter]
+            return all_tasks
+        finally:
+            conn.close()
 
     def toggle_task(self, task_id, current_status):
-        # Postgresissa boolean on True/False, käännetään se
         new_status = not current_status
         query = "UPDATE tasks SET completed = %s WHERE id = %s"
-        with self.conn.cursor() as cur:
-            cur.execute(query, (new_status, task_id))
-            self.conn.commit()
+        conn = self.get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(query, (new_status, task_id))
+            conn.commit()
+        finally:
+            conn.close()
     
     def delete_task(self, task_id):
         query = "DELETE FROM tasks WHERE id = %s"
-        with self.conn.cursor() as cur:
-            cur.execute(query, (task_id,))
-            self.conn.commit()
+        conn = self.get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(query, (task_id,))
+            conn.commit()
+        finally:
+            conn.close()
 
-# Virheenkäsittely jos tietokantaan ei saada yhteyttä
-try:
-    if DATABASE_URL:
-        db = TaskManager()
-    else:
-        db = None
-except Exception as e:
-    print("VIRHE TIETOKANTAAN YHDISTÄMISESSÄ:", e)
-    db = None
+# Luodaan manageri, mutta se ei yhdistä vielä mihinkään (turvallista)
+db = TaskManager()
 
 def main(page: ft.Page):
     page.title = "Retro Taskmaster"
@@ -126,9 +144,11 @@ def main(page: ft.Page):
     page.theme = ft.Theme(font_family="Retro")
     page.locale = "fi-FI"
 
-    # Tarkistetaan onko tietokanta kunnossa
-    if db is None:
-        page.add(ft.Text("VIRHE: Tietokantayhteys puuttuu. Tarkista Renderin asetukset (DATABASE_URL).", color="red", size=20))
+    # Yritetään luoda taulu heti alussa. Jos se epäonnistuu, näytetään virhe.
+    try:
+        db.create_table()
+    except Exception as e:
+        page.add(ft.Text(f"VIRHE: Tietokantaan ei saada yhteyttä.\n{e}", color="red"))
         return
 
     editing_task_id = ft.Ref[int]()
@@ -187,7 +207,13 @@ def main(page: ft.Page):
 
     def render_tasks(category_filter="Kaikki"):
         tasks_column.controls.clear()
-        tasks = db.get_tasks(category_filter)
+        try:
+            tasks = db.get_tasks(category_filter)
+        except Exception as e:
+            # Jos yhteys katkeaa kesken käytön, näytetään virhe eikä kaaduta
+            tasks_column.controls.append(ft.Text(f"Yhteysvirhe: {e}", color="red"))
+            page.update()
+            return
 
         if not tasks:
             tasks_column.controls.append(ft.Container(
@@ -236,12 +262,18 @@ def main(page: ft.Page):
         render_tasks(tab_name)
 
     def toggle_status(t_id, current_val):
-        db.toggle_task(t_id, current_val)
-        refresh_list()
+        try:
+            db.toggle_task(t_id, current_val)
+            refresh_list()
+        except Exception as e:
+            page.open(ft.SnackBar(ft.Text(f"Virhe: {e}"), bgcolor="red"))
 
     def delete_task_click(t_id):
-        db.delete_task(t_id)
-        refresh_list()
+        try:
+            db.delete_task(t_id)
+            refresh_list()
+        except Exception as e:
+            page.open(ft.SnackBar(ft.Text(f"Virhe: {e}"), bgcolor="red"))
 
     def save_task(e):
         if not new_task_name.value:
@@ -249,22 +281,25 @@ def main(page: ft.Page):
             new_task_name.update()
             return
         
-        if editing_task_id.current is not None:
-            db.update_task(editing_task_id.current, new_task_name.value, new_task_cat.value, date_input.value)
-            msg = "Päivitetty!"
-        else:
-            db.add_task(new_task_name.value, new_task_cat.value, date_input.value)
-            msg = "Luotu!"
-        
-        page.close(add_dialog)
-        page.update()
-        refresh_list()
-        page.open(ft.SnackBar(ft.Text(msg, color=COLOR_BG), bgcolor=COLOR_TEXT))
+        try:
+            if editing_task_id.current is not None:
+                db.update_task(editing_task_id.current, new_task_name.value, new_task_cat.value, date_input.value)
+                msg = "Päivitetty!"
+            else:
+                db.add_task(new_task_name.value, new_task_cat.value, date_input.value)
+                msg = "Luotu!"
+            
+            page.close(add_dialog)
+            page.update()
+            refresh_list()
+            page.open(ft.SnackBar(ft.Text(msg, color=COLOR_BG), bgcolor=COLOR_TEXT))
+        except Exception as ex:
+             page.open(ft.SnackBar(ft.Text(f"Tallennusvirhe: {ex}"), bgcolor="red"))
 
     def close_dialog(e):
         page.close(add_dialog)
 
-    # --- DIALOGI (POPUP) ---
+    # --- DIALOGI ---
     add_dialog = ft.AlertDialog(
         title=ft.Text("Tehtävä", color=COLOR_TEXT),
         bgcolor=COLOR_BG,
@@ -334,5 +369,4 @@ def main(page: ft.Page):
     render_tasks("Kaikki")
 
 port = int(os.environ.get("PORT", 8080))
-
 ft.app(target=main, view=ft.AppView.WEB_BROWSER, port=port, host="0.0.0.0")
