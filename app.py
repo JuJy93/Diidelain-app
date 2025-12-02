@@ -1,9 +1,11 @@
 import flet as ft
-import sqlite3
+import os
+import psycopg2
 from datetime import datetime
 
 # --- ASETUKSET (RETRO SUMMER TEEMA) ---
-DB_FILENAME = "tasks.db"
+# Haetaan tietokannan osoite Renderin asetuksista
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 # Väripaletti
 COLOR_BG = "#FAECB6"        # Vanilla (Tausta)
@@ -22,12 +24,17 @@ CAT_COLORS = {
 # --- PÄIVÄMÄÄRÄMUUNTIMET ---
 def date_db_to_fi(db_date):
     try:
-        parts = db_date.split("-")
-        if len(parts) == 3:
-            return f"{parts[2]}.{parts[1]}.{parts[0]}"
+        if db_date:
+            # Postgres voi palauttaa päivämäärän date-objektina tai merkkijonona
+            if isinstance(db_date, str):
+                parts = db_date.split("-")
+                if len(parts) == 3:
+                    return f"{parts[2]}.{parts[1]}.{parts[0]}"
+            else:
+                return db_date.strftime("%d.%m.%Y")
     except:
         pass
-    return db_date
+    return str(db_date) if db_date else ""
 
 def date_fi_to_db(fi_date):
     try:
@@ -43,50 +50,73 @@ def date_fi_to_db(fi_date):
 
 class TaskManager:
     def __init__(self):
-        self.conn = sqlite3.connect(DB_FILENAME, check_same_thread=False)
+        # Yhdistetään Neon/Postgres-tietokantaan
+        self.conn = psycopg2.connect(DATABASE_URL, sslmode='require')
         self.create_table()
 
     def create_table(self):
-        self.conn.execute("""
+        # Postgres käyttää SERIAL eikä AUTOINCREMENT
+        query = """
         CREATE TABLE IF NOT EXISTS tasks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             content TEXT,
             category TEXT,
-            deadline TEXT,
-            completed INTEGER DEFAULT 0
+            deadline DATE,
+            completed BOOLEAN DEFAULT FALSE
         )
-        """)
-        self.conn.commit()
+        """
+        with self.conn.cursor() as cur:
+            cur.execute(query)
+            self.conn.commit()
 
     def add_task(self, content, category, deadline):
         db_date = date_fi_to_db(deadline)
-        self.conn.execute("INSERT INTO tasks (content, category, deadline) VALUES (?, ?, ?)", 
-                          (content, category, db_date))
-        self.conn.commit()
+        # Postgres käyttää %s merkintää
+        query = "INSERT INTO tasks (content, category, deadline) VALUES (%s, %s, %s)"
+        with self.conn.cursor() as cur:
+            cur.execute(query, (content, category, db_date))
+            self.conn.commit()
 
     def update_task(self, task_id, content, category, deadline):
         db_date = date_fi_to_db(deadline)
-        self.conn.execute("UPDATE tasks SET content=?, category=?, deadline=? WHERE id=?", 
-                          (content, category, db_date, task_id))
-        self.conn.commit()
+        query = "UPDATE tasks SET content=%s, category=%s, deadline=%s WHERE id=%s"
+        with self.conn.cursor() as cur:
+            cur.execute(query, (content, category, db_date, task_id))
+            self.conn.commit()
 
     def get_tasks(self, category_filter=None):
-        cursor = self.conn.execute("SELECT id, content, category, deadline, completed FROM tasks ORDER BY deadline ASC")
-        all_tasks = cursor.fetchall()
+        query = "SELECT id, content, category, deadline, completed FROM tasks ORDER BY deadline ASC"
+        with self.conn.cursor() as cur:
+            cur.execute(query)
+            all_tasks = cur.fetchall()
+        
         if category_filter and category_filter != "Kaikki":
             return [t for t in all_tasks if t[2] == category_filter]
         return all_tasks
 
     def toggle_task(self, task_id, current_status):
-        new_status = 0 if current_status else 1
-        self.conn.execute("UPDATE tasks SET completed = ? WHERE id = ?", (new_status, task_id))
-        self.conn.commit()
+        # Postgresissa boolean on True/False, käännetään se
+        new_status = not current_status
+        query = "UPDATE tasks SET completed = %s WHERE id = %s"
+        with self.conn.cursor() as cur:
+            cur.execute(query, (new_status, task_id))
+            self.conn.commit()
     
     def delete_task(self, task_id):
-        self.conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
-        self.conn.commit()
+        query = "DELETE FROM tasks WHERE id = %s"
+        with self.conn.cursor() as cur:
+            cur.execute(query, (task_id,))
+            self.conn.commit()
 
-db = TaskManager()
+# Virheenkäsittely jos tietokantaan ei saada yhteyttä
+try:
+    if DATABASE_URL:
+        db = TaskManager()
+    else:
+        db = None
+except Exception as e:
+    print("VIRHE TIETOKANTAAN YHDISTÄMISESSÄ:", e)
+    db = None
 
 def main(page: ft.Page):
     page.title = "Retro Taskmaster"
@@ -95,6 +125,11 @@ def main(page: ft.Page):
     page.fonts = {"Retro": "https://github.com/google/fonts/raw/main/ofl/pressstart2p/PressStart2P-Regular.ttf"}
     page.theme = ft.Theme(font_family="Retro")
     page.locale = "fi-FI"
+
+    # Tarkistetaan onko tietokanta kunnossa
+    if db is None:
+        page.add(ft.Text("VIRHE: Tietokantayhteys puuttuu. Tarkista Renderin asetukset (DATABASE_URL).", color="red", size=20))
+        return
 
     editing_task_id = ft.Ref[int]()
     editing_task_id.current = None
@@ -282,7 +317,6 @@ def main(page: ft.Page):
 
     page.appbar = ft.AppBar(title=ft.Text("DIIDELAINIT", color=COLOR_BG, font_family="Retro"), center_title=True, bgcolor=COLOR_PRIMARY)
     
-    # KORJAUS: color -> foreground_color
     page.floating_action_button = ft.FloatingActionButton(
         icon=ft.Icons.ADD, 
         bgcolor=COLOR_PRIMARY, 
@@ -299,4 +333,6 @@ def main(page: ft.Page):
 
     render_tasks("Kaikki")
 
-ft.app(target=main, view=ft.AppView.WEB_BROWSER)
+port = int(os.environ.get("PORT", 8080))
+
+ft.app(target=main, view=ft.AppView.WEB_BROWSER, port=port, host="0.0.0.0")
