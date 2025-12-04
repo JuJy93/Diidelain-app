@@ -5,8 +5,6 @@ from datetime import datetime
 
 # --- ASETUKSET ---
 
-# TÄMÄ ON TURVALLINEN VERSIO GITHUBIIN.
-# Render syöttää osoitteen tähän automaattisesti taustalla.
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 # Teeman värit
@@ -18,6 +16,7 @@ COLOR_DELETE = "#F96635"
 
 # Ikonit
 AVAILABLE_ICONS = {
+    "Kansio": ft.Icons.FOLDER,
     "Työ": ft.Icons.WORK,
     "Koulu": ft.Icons.SCHOOL,
     "Koti": ft.Icons.HOME,
@@ -71,9 +70,8 @@ def date_fi_to_db(fi_date):
 # --- TIETOKANTA ---
 class TaskManager:
     def get_connection(self):
-        if not DATABASE_URL:
-            # Tämä virhe tulee vain jos Renderin asetukset puuttuvat
-            raise Exception("DATABASE_URL puuttuu! Aseta se Renderin Environment Variables -kohtaan.")
+        if not DATABASE_URL or "LIITÄ" in DATABASE_URL:
+            raise Exception("Tietokantaosoite puuttuu! Muokkaa app.py riviä 8.")
         return psycopg2.connect(DATABASE_URL, sslmode='require')
 
     def create_tables(self):
@@ -81,6 +79,7 @@ class TaskManager:
         try:
             conn = self.get_connection()
             with conn.cursor() as cur:
+                # 1. Tehtävät
                 cur.execute("""
                 CREATE TABLE IF NOT EXISTS tasks (
                     id SERIAL PRIMARY KEY,
@@ -90,6 +89,18 @@ class TaskManager:
                     completed BOOLEAN DEFAULT FALSE
                 )
                 """)
+                
+                # 2. Pääkategoriat (UUSI)
+                cur.execute("""
+                CREATE TABLE IF NOT EXISTS master_categories (
+                    id SERIAL PRIMARY KEY,
+                    name TEXT UNIQUE,
+                    color TEXT,
+                    icon_name TEXT
+                )
+                """)
+
+                # 3. Kategoriat (Lisätään master_id sarake jos puuttuu)
                 cur.execute("""
                 CREATE TABLE IF NOT EXISTS categories (
                     id SERIAL PRIMARY KEY,
@@ -98,6 +109,15 @@ class TaskManager:
                     icon_name TEXT
                 )
                 """)
+                
+                # Päivitetään categories-tauluun master_id sarake (Migraatio)
+                try:
+                    cur.execute("ALTER TABLE categories ADD COLUMN master_id INTEGER REFERENCES master_categories(id)")
+                    conn.commit()
+                except:
+                    conn.rollback() # Sarake on jo olemassa
+
+                # Oletuskategoriat
                 cur.execute("SELECT count(*) FROM categories")
                 if cur.fetchone()[0] == 0:
                     defaults = [
@@ -113,30 +133,63 @@ class TaskManager:
         finally:
             if conn: conn.close()
 
-    def get_categories(self):
+    # --- PÄÄKATEGORIA METODIT ---
+    def get_master_categories(self):
         conn = self.get_connection()
         try:
             with conn.cursor() as cur:
-                cur.execute("SELECT id, name, color, icon_name FROM categories ORDER BY id ASC")
+                cur.execute("SELECT id, name, color, icon_name FROM master_categories ORDER BY id ASC")
                 return cur.fetchall()
         finally:
             conn.close()
 
-    def add_category(self, name, color, icon_name):
+    def add_master_category(self, name, color, icon_name):
         conn = self.get_connection()
         try:
             with conn.cursor() as cur:
-                cur.execute("INSERT INTO categories (name, color, icon_name) VALUES (%s, %s, %s)", (name, color, icon_name))
+                cur.execute("INSERT INTO master_categories (name, color, icon_name) VALUES (%s, %s, %s)", (name, color, icon_name))
+            conn.commit()
+        finally:
+            conn.close()
+            
+    def delete_master_category(self, m_id):
+        conn = self.get_connection()
+        try:
+            with conn.cursor() as cur:
+                # Vapautetaan alikategoriat ensin (master_id -> NULL)
+                cur.execute("UPDATE categories SET master_id = NULL WHERE master_id = %s", (m_id,))
+                cur.execute("DELETE FROM master_categories WHERE id = %s", (m_id,))
             conn.commit()
         finally:
             conn.close()
 
-    def update_category(self, old_name, new_name, color, icon_name):
+    # --- ALIKATEGORIA METODIT ---
+    def get_categories(self):
+        # Haetaan myös master_id tieto
         conn = self.get_connection()
         try:
             with conn.cursor() as cur:
-                cur.execute("UPDATE categories SET name=%s, color=%s, icon_name=%s WHERE name=%s", 
-                           (new_name, color, icon_name, old_name))
+                cur.execute("SELECT id, name, color, icon_name, master_id FROM categories ORDER BY id ASC")
+                return cur.fetchall()
+        finally:
+            conn.close()
+
+    def add_category(self, name, color, icon_name, master_id):
+        conn = self.get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("INSERT INTO categories (name, color, icon_name, master_id) VALUES (%s, %s, %s, %s)", 
+                           (name, color, icon_name, master_id))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def update_category(self, old_name, new_name, color, icon_name, master_id):
+        conn = self.get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE categories SET name=%s, color=%s, icon_name=%s, master_id=%s WHERE name=%s", 
+                           (new_name, color, icon_name, master_id, old_name))
                 if old_name != new_name:
                     cur.execute("UPDATE tasks SET category=%s WHERE category=%s", (new_name, old_name))
             conn.commit()
@@ -153,6 +206,7 @@ class TaskManager:
         finally:
             conn.close()
 
+    # --- TEHTÄVÄT ---
     def add_task(self, content, category, deadline):
         db_date = date_fi_to_db(deadline)
         conn = self.get_connection()
@@ -173,14 +227,24 @@ class TaskManager:
         finally:
             conn.close()
 
-    def get_tasks(self, category_filter=None):
+    def get_tasks(self, category_filter="Kaikki", sub_categories=None):
         conn = self.get_connection()
         try:
             with conn.cursor() as cur:
-                cur.execute("SELECT id, content, category, deadline, completed FROM tasks ORDER BY deadline ASC")
+                # Jos sub_categories on lista (esim. ["Työ", "Projekti 1"]), haetaan ne kaikki
+                if sub_categories:
+                    # SQL IN-lause vaatii hieman kikkailua pythonissa tuplella
+                    placeholders = '%s,' * len(sub_categories)
+                    placeholders = placeholders[:-1] # Poista viimeinen pilkku
+                    query = f"SELECT id, content, category, deadline, completed FROM tasks WHERE category IN ({placeholders}) ORDER BY deadline ASC"
+                    cur.execute(query, tuple(sub_categories))
+                else:
+                    cur.execute("SELECT id, content, category, deadline, completed FROM tasks ORDER BY deadline ASC")
+                
                 all_tasks = cur.fetchall()
             
-            if category_filter and category_filter != "Kaikki":
+            # Jos suodatus on päällä ja ei käytetty sub_categories-hakua (esim. "Kaikki" tai yksittäinen orpo kategoria)
+            if not sub_categories and category_filter and category_filter != "Kaikki":
                 return [t for t in all_tasks if t[2] == category_filter]
             return all_tasks
         finally:
@@ -221,12 +285,14 @@ def main(page: ft.Page):
         page.add(ft.Text(f"Tietokantavirhe: {e}", color="red"))
         return
 
+    # Välimuistit
+    current_categories = [] # [(id, name, color, icon, master_id)]
+    current_masters = []    # [(id, name, color, icon)]
+    
     editing_task_id = ft.Ref[int]()
     editing_task_id.current = None
-    
-    current_categories = [] 
 
-    # --- UI RAKENNE ---
+    # --- UI COMPONENTIT ---
     tasks_column = ft.Column(spacing=10, scroll=ft.ScrollMode.AUTO)
     
     tabs_control = ft.Tabs(
@@ -238,14 +304,15 @@ def main(page: ft.Page):
         divider_color="transparent"
     )
 
-    # --- TOIMINNOT ---
+    # --- LOGIIKKA ---
 
-    def load_categories():
-        nonlocal current_categories
+    def load_data():
+        nonlocal current_categories, current_masters
         try:
             current_categories = db.get_categories()
+            current_masters = db.get_master_categories()
         except:
-            current_categories = []
+            pass
 
     def get_cat_color(cat_name):
         for c in current_categories:
@@ -254,9 +321,7 @@ def main(page: ft.Page):
         return COLOR_PRIMARY
 
     def rebuild_tabs():
-        # Tarkistetaan onko kontrolli sivulla
-        if not tabs_control.page:
-            return
+        if not tabs_control.page: return
 
         selected_text = "Kaikki"
         if tabs_control.tabs and tabs_control.selected_index is not None and tabs_control.selected_index < len(tabs_control.tabs):
@@ -264,14 +329,22 @@ def main(page: ft.Page):
         
         new_tabs = [ft.Tab(text="Kaikki", icon=ft.Icons.LIST)]
         
+        # 1. Lisätään ensin PÄÄKATEGORIAT (Niput)
+        for m in current_masters:
+            m_name, m_icon = m[1], m[3]
+            real_icon = AVAILABLE_ICONS.get(m_icon, ft.Icons.FOLDER)
+            new_tabs.append(ft.Tab(text=m_name, icon=real_icon)) # Pääkategorian nimi
+
+        # 2. Lisätään "Orvot" kategoriat (joilla ei ole master_id:tä)
         for cat in current_categories:
-            c_name = cat[1]
-            c_icon_key = cat[3]
-            real_icon = AVAILABLE_ICONS.get(c_icon_key, ft.Icons.CIRCLE)
-            new_tabs.append(ft.Tab(text=c_name, icon=real_icon))
+            c_name, c_icon_key, c_master_id = cat[1], cat[3], cat[4]
+            if c_master_id is None: # Vain jos ei kuulu nippuun
+                real_icon = AVAILABLE_ICONS.get(c_icon_key, ft.Icons.CIRCLE)
+                new_tabs.append(ft.Tab(text=c_name, icon=real_icon))
             
         tabs_control.tabs = new_tabs
         
+        # Palautetaan valinta
         found_index = 0
         for i, t in enumerate(new_tabs):
             if t.text == selected_text:
@@ -280,18 +353,38 @@ def main(page: ft.Page):
         tabs_control.selected_index = found_index
         tabs_control.update()
 
-    def render_tasks(category_filter="Kaikki"):
+    def render_tasks(tab_name="Kaikki"):
         tasks_column.controls.clear()
+        
+        tasks = []
         try:
-            tasks = db.get_tasks(category_filter)
+            if tab_name == "Kaikki":
+                tasks = db.get_tasks("Kaikki")
+            else:
+                # Tarkistetaan onko tämä tab_name Pääkategoria vai tavallinen
+                master_cat = next((m for m in current_masters if m[1] == tab_name), None)
+                
+                if master_cat:
+                    # Se on pääkategoria! Haetaan kaikki sen lapset.
+                    m_id = master_cat[0]
+                    child_cats = [c[1] for c in current_categories if c[4] == m_id]
+                    
+                    if not child_cats:
+                        tasks = [] # Ei alikategorioita -> ei tehtäviä
+                    else:
+                        tasks = db.get_tasks(sub_categories=child_cats)
+                else:
+                    # Se on tavallinen orpo kategoria
+                    tasks = db.get_tasks(category_filter=tab_name)
+
         except Exception as e:
-            tasks_column.controls.append(ft.Text(f"Yhteysvirhe: {e}", color="red"))
+            tasks_column.controls.append(ft.Text(f"Virhe: {e}", color="red"))
             page.update()
             return
 
         if not tasks:
             tasks_column.controls.append(ft.Container(
-                content=ft.Text("Ei tehtäviä!", color=COLOR_TEXT),
+                content=ft.Text("Ei tehtäviä tässä nipussa!", color=COLOR_TEXT),
                 padding=20, alignment=ft.alignment.center
             ))
         
@@ -322,25 +415,18 @@ def main(page: ft.Page):
         page.update()
 
     def refresh_main_view():
-        load_categories()
+        load_data()
         rebuild_tabs()
         current_tab_text = "Kaikki"
         if tabs_control.tabs and tabs_control.selected_index is not None:
              current_tab_text = tabs_control.tabs[tabs_control.selected_index].text
         render_tasks(current_tab_text)
 
-    # --- DIALOGIT ---
-    
+    # --- TASK DIALOG ---
     new_task_name = ft.TextField(label="Tehtävä", border_color=COLOR_PRIMARY, color=COLOR_TEXT, expand=True)
     new_task_cat_dropdown = ft.Dropdown(label="Kategoria", border_color=COLOR_PRIMARY, color=COLOR_TEXT, width=200)
     date_input = ft.TextField(label="Pvm", value=datetime.now().strftime("%d.%m.%Y"), border_color=COLOR_PRIMARY, color=COLOR_TEXT, width=150)
-    
-    def change_date(e):
-        if date_picker.value:
-            date_input.value = date_picker.value.strftime("%d.%m.%Y")
-            date_input.update()
-    
-    date_picker = ft.DatePicker(on_change=change_date)
+    date_picker = ft.DatePicker(on_change=lambda e: (setattr(date_input, 'value', date_picker.value.strftime("%d.%m.%Y")), date_input.update()) if date_picker.value else None)
     calendar_btn = ft.IconButton(icon=ft.Icons.CALENDAR_MONTH, icon_color=COLOR_PRIMARY, on_click=lambda _: page.open(date_picker))
 
     add_dialog = ft.AlertDialog(
@@ -353,26 +439,72 @@ def main(page: ft.Page):
         ]
     )
 
+    # --- SETTINGS DIALOG (KATEGORIAT & PÄÄKATEGORIAT) ---
+    # Tabs for settings
+    settings_tabs = ft.Tabs(
+        selected_index=0,
+        tabs=[ft.Tab(text="Kategoriat"), ft.Tab(text="Pääkategoriat (Niput)")],
+        label_color=COLOR_PRIMARY,
+        indicator_color=COLOR_PRIMARY
+    )
+
+    # SUB-CATEGORY EDIT
     cat_edit_name = ft.TextField(label="Nimi", border_color=COLOR_PRIMARY, color=COLOR_TEXT)
     cat_edit_color = ft.Dropdown(label="Väri", border_color=COLOR_PRIMARY, options=[ft.dropdown.Option(k) for k in AVAILABLE_COLORS.keys()])
     cat_edit_icon = ft.Dropdown(label="Ikoni", border_color=COLOR_PRIMARY, options=[ft.dropdown.Option(k) for k in AVAILABLE_ICONS.keys()])
-    categories_list_view = ft.Column(spacing=5, scroll=ft.ScrollMode.AUTO, height=200)
+    cat_edit_master = ft.Dropdown(label="Kuuluu nippuun", border_color=COLOR_PRIMARY, options=[])
+    categories_list_view = ft.Column(spacing=5, scroll=ft.ScrollMode.AUTO, height=150)
+
+    # MASTER CATEGORY EDIT
+    master_edit_name = ft.TextField(label="Nipun nimi", border_color=COLOR_PRIMARY, color=COLOR_TEXT)
+    master_edit_icon = ft.Dropdown(label="Ikoni", border_color=COLOR_PRIMARY, options=[ft.dropdown.Option(k) for k in AVAILABLE_ICONS.keys()])
+    masters_list_view = ft.Column(spacing=5, scroll=ft.ScrollMode.AUTO, height=150)
+
+    settings_content = ft.Column([
+        settings_tabs,
+        # KATEGORIA NÄKYMÄ
+        ft.Container(
+            content=ft.Column([
+                ft.Text("Lisää/Muokkaa Kategoriaa:", size=12, color=COLOR_TEXT),
+                cat_edit_name,
+                ft.Row([cat_edit_color, cat_edit_icon]),
+                cat_edit_master,
+                ft.ElevatedButton(content=ft.Text("Tallenna Kategoria", color=COLOR_BG), bgcolor=COLOR_PRIMARY, on_click=lambda e: save_category(e)),
+                ft.Divider(),
+                categories_list_view
+            ]),
+            visible=True # Vaihdetaan näkyvyyttä tabin mukaan
+        ),
+        # PÄÄKATEGORIA NÄKYMÄ
+        ft.Container(
+            content=ft.Column([
+                ft.Text("Lisää/Muokkaa Nippua:", size=12, color=COLOR_TEXT),
+                master_edit_name,
+                master_edit_icon,
+                ft.ElevatedButton(content=ft.Text("Tallenna Nippu", color=COLOR_BG), bgcolor=COLOR_PRIMARY, on_click=lambda e: save_master(e)),
+                ft.Divider(),
+                masters_list_view
+            ]),
+            visible=False
+        )
+    ], height=450, width=350)
+
+    def change_settings_tab(e):
+        idx = e.control.selected_index
+        settings_content.controls[1].visible = (idx == 0)
+        settings_content.controls[2].visible = (idx == 1)
+        settings_content.update()
+
+    settings_tabs.on_change = change_settings_tab
 
     settings_dialog = ft.AlertDialog(
-        title=ft.Text("Kategoriat", color=COLOR_TEXT),
+        title=ft.Text("Asetukset", color=COLOR_TEXT),
         bgcolor=COLOR_BG,
-        content=ft.Column([
-            ft.Text("Lisää/Muokkaa:", size=12, color=COLOR_TEXT),
-            cat_edit_name,
-            ft.Row([cat_edit_color, cat_edit_icon]),
-            ft.ElevatedButton(content=ft.Text("Tallenna", color=COLOR_BG), bgcolor=COLOR_PRIMARY, on_click=lambda e: save_category(e)),
-            ft.Divider(),
-            categories_list_view
-        ], height=400, width=350),
+        content=settings_content,
         actions=[ft.TextButton(content=ft.Text("Sulje", color=COLOR_TEXT), on_click=lambda e: close_settings(e))]
     )
 
-    # --- TAPAHTUMAKÄSITTELIJÄT ---
+    # --- TOIMINTAFUNKTIOT ---
 
     def save_task(e):
         if not new_task_name.value: return
@@ -421,7 +553,9 @@ def main(page: ft.Page):
         add_dialog.title = ft.Text("Muokkaa", color=COLOR_TEXT)
         page.open(add_dialog)
 
-    def render_categories_list():
+    # --- SETTINGS RENDERÖINTI ---
+    def render_settings_lists():
+        # Alikategoriat
         categories_list_view.controls.clear()
         for c in current_categories:
             c_name, c_color, c_icon = c[1], c[2], c[3]
@@ -436,8 +570,29 @@ def main(page: ft.Page):
             )
             categories_list_view.controls.append(row)
         
+        # Pääkategoriat
+        masters_list_view.controls.clear()
+        for m in current_masters:
+            m_id, m_name, m_icon = m[0], m[1], m[3]
+            row = ft.Container(
+                content=ft.Row([
+                    ft.Icon(AVAILABLE_ICONS.get(m_icon, ft.Icons.FOLDER), color=COLOR_PRIMARY),
+                    ft.Text(m_name, color=COLOR_TEXT, expand=True),
+                    ft.IconButton(icon=ft.Icons.DELETE, icon_color=COLOR_DELETE, on_click=lambda e, x=m_id: delete_master(x))
+                ]),
+                bgcolor="#FFFFFF", padding=5, border_radius=5
+            )
+            masters_list_view.controls.append(row)
+
         if categories_list_view.page:
             categories_list_view.update()
+            masters_list_view.update()
+
+    def update_master_dropdown():
+        # Päivitetään "Kuuluu nippuun" -lista
+        cat_edit_master.options = [ft.dropdown.Option(key=m[0], text=m[1]) for m in current_masters]
+        cat_edit_master.options.insert(0, ft.dropdown.Option(key="NULL", text="Ei nippua (Orpo)"))
+        if cat_edit_master.page: cat_edit_master.update()
 
     def prefill_cat_form(cat_data):
         cat_edit_name.value = cat_data[1]
@@ -445,6 +600,10 @@ def main(page: ft.Page):
         found_color = next((k for k, v in AVAILABLE_COLORS.items() if v == cat_data[2]), None)
         cat_edit_color.value = found_color
         cat_edit_icon.value = cat_data[3]
+        
+        m_id = cat_data[4]
+        cat_edit_master.value = m_id if m_id else "NULL"
+        
         settings_dialog.update()
 
     def save_category(e):
@@ -452,17 +611,36 @@ def main(page: ft.Page):
         real_color = AVAILABLE_COLORS.get(cat_edit_color.value, COLOR_PRIMARY)
         icon_name = cat_edit_icon.value or "Muu"
         
+        # Master ID (Nippu)
+        master_val = cat_edit_master.value
+        real_master_id = None
+        if master_val and master_val != "NULL":
+            real_master_id = int(master_val)
+
         try:
             if hasattr(cat_edit_name, 'data') and cat_edit_name.data:
-                db.update_category(cat_edit_name.data, cat_edit_name.value, real_color, icon_name)
+                db.update_category(cat_edit_name.data, cat_edit_name.value, real_color, icon_name, real_master_id)
                 cat_edit_name.data = None
             else:
-                db.add_category(cat_edit_name.value, real_color, icon_name)
+                db.add_category(cat_edit_name.value, real_color, icon_name, real_master_id)
             
             cat_edit_name.value = ""
-            load_categories()
-            render_categories_list()
-            page.open(ft.SnackBar(ft.Text("Tallennettu", color=COLOR_BG), bgcolor=COLOR_TEXT))
+            load_data()
+            render_settings_lists()
+            page.open(ft.SnackBar(ft.Text("Kategoria tallennettu", color=COLOR_BG), bgcolor=COLOR_TEXT))
+        except Exception as ex:
+            page.open(ft.SnackBar(ft.Text(f"Virhe: {ex}"), bgcolor="red"))
+
+    def save_master(e):
+        if not master_edit_name.value: return
+        icon_name = master_edit_icon.value or "Kansio"
+        try:
+            db.add_master_category(master_edit_name.value, "None", icon_name)
+            master_edit_name.value = ""
+            load_data()
+            render_settings_lists()
+            update_master_dropdown()
+            page.open(ft.SnackBar(ft.Text("Nippu luotu", color=COLOR_BG), bgcolor=COLOR_TEXT))
         except Exception as ex:
             page.open(ft.SnackBar(ft.Text(f"Virhe: {ex}"), bgcolor="red"))
 
@@ -470,13 +648,22 @@ def main(page: ft.Page):
         if name == "Muu": return
         try:
             db.delete_category(name)
-            load_categories()
+            load_data()
             render_categories_list()
         except: pass
 
+    def delete_master(m_id):
+        try:
+            db.delete_master_category(m_id)
+            load_data()
+            render_settings_lists()
+            update_master_dropdown()
+        except: pass
+
     def open_settings(e):
-        load_categories()
-        render_categories_list()
+        load_data()
+        render_settings_lists()
+        update_master_dropdown()
         page.open(settings_dialog)
 
     def close_settings(e):
@@ -488,8 +675,7 @@ def main(page: ft.Page):
 
     tabs_control.on_change = tab_changed
 
-    # --- SIVUN ALUSTUS (KORJATTU JÄRJESTYS) ---
-    
+    # --- ALUSTUS ---
     page.appbar = ft.AppBar(
         title=ft.Text("DIIDELAINIT", color=COLOR_BG, font_family="Retro"), 
         center_title=True, 
@@ -511,10 +697,7 @@ def main(page: ft.Page):
         ], expand=True)
     )
 
-    # Vasta nyt päivitetään data
-    load_categories()
-    rebuild_tabs()
-    render_tasks("Kaikki")
+    refresh_main_view()
 
 port = int(os.environ.get("PORT", 8080))
 ft.app(target=main, view=ft.AppView.WEB_BROWSER, port=port, host="0.0.0.0")
