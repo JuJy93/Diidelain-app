@@ -13,7 +13,7 @@ COLOR_TEXT = "#333333"
 COLOR_CARD = "#FFFDF0"
 COLOR_DELETE = "#F96635"
 
-# Laajennettu ikonivalikoima
+# Laajennettu ikonivalikoima (KORJATTU LAHJA-IKONI)
 AVAILABLE_ICONS = {
     "Kansio": ft.Icons.FOLDER,
     "Nainen": ft.Icons.WOMAN,
@@ -33,7 +33,7 @@ AVAILABLE_ICONS = {
     "Raha": ft.Icons.ATTACH_MONEY,
     "Idea": ft.Icons.LIGHTBULB,
     "Musiikki": ft.Icons.MUSIC_NOTE,
-    "Lahja": ft.Icons.CARD_GIFTCHARD,
+    "Lahja": ft.Icons.CARD_GIFTCARD,  # <--- TÄMÄ OLI KORJATTU
     "Muu": ft.Icons.CIRCLE
 }
 
