@@ -5,7 +5,6 @@ from datetime import datetime
 
 # --- ASETUKSET ---
 DATABASE_URL = os.getenv("DATABASE_URL")
-
 # Teeman värit
 COLOR_BG = "#FAECB6"
 COLOR_PRIMARY = "#2BBAA5"
@@ -295,7 +294,6 @@ def main(page: ft.Page):
         page.add(ft.Text(f"Tietokantavirhe: {e}", color="red"))
         return
 
-    # Välimuistit
     current_categories = [] 
     current_masters = []    
     
@@ -357,7 +355,6 @@ def main(page: ft.Page):
         tabs_control.selected_index = found_index
         tabs_control.update()
 
-    # --- PÄÄNÄKYMÄN RENDERÖINTI (KORJATTU SILMUKKA) ---
     def render_tasks(tab_name="Kaikki"):
         tasks_column.controls.clear()
         tasks = []
@@ -404,7 +401,7 @@ def main(page: ft.Page):
             delete_btn = ft.IconButton(icon=ft.Icons.DELETE_OUTLINE, icon_color=COLOR_DELETE, on_click=lambda e, x=t_id: delete_task_click(x))
             edit_btn = ft.IconButton(icon=ft.Icons.EDIT, icon_color=COLOR_PRIMARY, on_click=lambda e, x=t: open_edit_dialog(x))
 
-            # --- LAAJENEVA SISÄLTÖ ---
+            # Kuvaus
             desc_text = ft.Text(
                 t_desc if t_desc else "Ei lisätietoja.", 
                 size=12, 
@@ -415,44 +412,54 @@ def main(page: ft.Page):
             
             info_icon = ft.Icon(ft.Icons.INFO_OUTLINE, size=16, color=COLOR_PRIMARY, visible=bool(t_desc))
 
-            # KORJAUS: Sidotaan 'd' tähän nimenomaiseen desc_text -elementtiin
+            # Sidotaan 'd' oikeaan elementtiin
             def toggle_details(e, d=desc_text):
                 d.visible = not d.visible
                 page.update()
 
-            main_row = ft.Row([
-                ft.Container(width=10, bgcolor=cat_color, border_radius=ft.border_radius.only(top_left=10, bottom_left=10)),
-                ft.Checkbox(value=bool(t_completed), fill_color=COLOR_PRIMARY, on_change=lambda e, x=t_id, y=t_completed: toggle_status(x, y)),
+            # --- KORTIN SISÄLTÖ ---
+            card_content = ft.Column([
+                # Ylärivi
+                ft.Row([
+                    ft.Checkbox(value=bool(t_completed), fill_color=COLOR_PRIMARY, on_change=lambda e, x=t_id, y=t_completed: toggle_status(x, y)),
+                    
+                    # Keskiosa
+                    ft.Container(
+                        content=ft.Column([
+                            ft.Row([
+                                # expand=True sallii tekstin viedä tilaa, no_wrap=False sallii rivityksen
+                                ft.Text(t_content, style=ft.TextStyle(decoration=decor, color=COLOR_TEXT, size=14, weight=ft.FontWeight.BOLD), expand=True, no_wrap=False), 
+                                info_icon
+                            ], alignment=ft.MainAxisAlignment.START, vertical_alignment=ft.CrossAxisAlignment.START),
+                            
+                            ft.Text(f"{t_cat} | {display_date}", size=10, color=COLOR_TEXT),
+                        ], spacing=2),
+                        expand=True,
+                        on_click=toggle_details
+                    ),
+                    
+                    edit_btn, 
+                    delete_btn
+                ], alignment=ft.MainAxisAlignment.START, vertical_alignment=ft.CrossAxisAlignment.START),
                 
-                ft.Container(
-                    content=ft.Column([
-                        ft.Row([ft.Text(t_content, style=ft.TextStyle(decoration=decor, color=COLOR_TEXT, size=14, weight=ft.FontWeight.BOLD)), info_icon]),
-                        ft.Text(f"{t_cat} | {display_date}", size=10, color=COLOR_TEXT),
-                    ], spacing=2),
-                    expand=True,
-                    on_click=toggle_details 
-                ),
-                
-                edit_btn, 
-                delete_btn
-            ], alignment=ft.MainAxisAlignment.START, vertical_alignment=ft.CrossAxisAlignment.START)
-
-            task_card_content = ft.Column([
-                main_row,
+                # Kuvaus
                 ft.Container(
                     content=desc_text, 
-                    padding=ft.padding.only(left=50, right=10, bottom=10)
+                    padding=ft.padding.only(left=40, right=10, bottom=5)
                 )
             ], spacing=0)
 
+            # --- PÄÄCONTAINER (Väripalkki on nyt border_left) ---
             container = ft.Container(
-                content=task_card_content,
+                content=card_content,
                 bgcolor=bg_color,
                 border_radius=10,
+                # TÄMÄ ON SE RATKAISEVA KORJAUS:
+                border=ft.border.only(left=ft.BorderSide(10, cat_color)), 
+                padding=ft.padding.only(left=5, right=5, top=5, bottom=5),
                 opacity=opacity,
                 shadow=ft.BoxShadow(blur_radius=2, color="#33000000"),
                 animate_size=300,
-                padding=ft.padding.only(bottom=5)
             )
             
             tasks_column.controls.append(container)
@@ -497,7 +504,6 @@ def main(page: ft.Page):
         indicator_color=COLOR_PRIMARY
     )
 
-    # SUB-CATEGORY UI
     cat_edit_name = ft.TextField(label="Nimi", border_color=COLOR_PRIMARY, color=COLOR_TEXT)
     cat_edit_color = ft.Dropdown(label="Väri", border_color=COLOR_PRIMARY, options=[ft.dropdown.Option(k) for k in AVAILABLE_COLORS.keys()])
     cat_edit_icon = ft.Dropdown(label="Ikoni", border_color=COLOR_PRIMARY, options=[ft.dropdown.Option(k) for k in AVAILABLE_ICONS.keys()])
@@ -513,7 +519,6 @@ def main(page: ft.Page):
     cat_edit_master = ft.Dropdown(label="Kuuluu nippuun", border_color=COLOR_PRIMARY, options=[])
     categories_list_view = ft.Column(spacing=5, scroll=ft.ScrollMode.AUTO, height=150)
 
-    # MASTER CATEGORY UI
     master_edit_name = ft.TextField(label="Nipun nimi", border_color=COLOR_PRIMARY, color=COLOR_TEXT)
     master_edit_icon = ft.Dropdown(label="Ikoni", border_color=COLOR_PRIMARY, options=[ft.dropdown.Option(k) for k in AVAILABLE_ICONS.keys()])
     master_icon_preview = ft.Icon(ft.Icons.FOLDER, color=COLOR_PRIMARY, size=30) 
