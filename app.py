@@ -12,8 +12,9 @@ COLOR_PRIMARY = "#2BBAA5"
 COLOR_TEXT = "#333333"
 COLOR_CARD = "#FFFDF0"
 COLOR_DELETE = "#F96635"
+COLOR_DESC = "#666666"
 
-# Laajennettu ikonivalikoima (KORJATTU LAHJA-IKONI)
+# Ikonit
 AVAILABLE_ICONS = {
     "Kansio": ft.Icons.FOLDER,
     "Nainen": ft.Icons.WOMAN,
@@ -33,7 +34,7 @@ AVAILABLE_ICONS = {
     "Raha": ft.Icons.ATTACH_MONEY,
     "Idea": ft.Icons.LIGHTBULB,
     "Musiikki": ft.Icons.MUSIC_NOTE,
-    "Lahja": ft.Icons.CARD_GIFTCARD,  # <--- TÄMÄ OLI KORJATTU
+    "Lahja": ft.Icons.CARD_GIFTCARD,
     "Muu": ft.Icons.CIRCLE
 }
 
@@ -79,8 +80,8 @@ def date_fi_to_db(fi_date):
 # --- TIETOKANTA ---
 class TaskManager:
     def get_connection(self):
-        if not DATABASE_URL:
-            raise Exception("DATABASE_URL puuttuu!")
+        if not DATABASE_URL or "LIITÄ" in DATABASE_URL:
+            raise Exception("DATABASE_URL puuttuu! Aseta se app.py riville 8.")
         return psycopg2.connect(DATABASE_URL, sslmode='require')
 
     def create_tables(self):
@@ -97,6 +98,12 @@ class TaskManager:
                     completed BOOLEAN DEFAULT FALSE
                 )
                 """)
+                try:
+                    cur.execute("ALTER TABLE tasks ADD COLUMN description TEXT")
+                    conn.commit()
+                except:
+                    conn.rollback()
+
                 cur.execute("""
                 CREATE TABLE IF NOT EXISTS master_categories (
                     id SERIAL PRIMARY KEY,
@@ -130,7 +137,7 @@ class TaskManager:
         finally:
             if conn: conn.close()
 
-    # --- PÄÄKATEGORIA METODIT ---
+    # --- PÄÄKATEGORIAT ---
     def get_master_categories(self):
         conn = self.get_connection()
         try:
@@ -168,7 +175,7 @@ class TaskManager:
         finally:
             conn.close()
 
-    # --- ALIKATEGORIA METODIT ---
+    # --- KATEGORIAT ---
     def get_categories(self):
         conn = self.get_connection()
         try:
@@ -211,22 +218,24 @@ class TaskManager:
             conn.close()
 
     # --- TEHTÄVÄT ---
-    def add_task(self, content, category, deadline):
+    def add_task(self, content, category, deadline, description):
         db_date = date_fi_to_db(deadline)
         conn = self.get_connection()
         try:
             with conn.cursor() as cur:
-                cur.execute("INSERT INTO tasks (content, category, deadline) VALUES (%s, %s, %s)", (content, category, db_date))
+                cur.execute("INSERT INTO tasks (content, category, deadline, description) VALUES (%s, %s, %s, %s)", 
+                           (content, category, db_date, description))
             conn.commit()
         finally:
             conn.close()
 
-    def update_task(self, task_id, content, category, deadline):
+    def update_task(self, task_id, content, category, deadline, description):
         db_date = date_fi_to_db(deadline)
         conn = self.get_connection()
         try:
             with conn.cursor() as cur:
-                cur.execute("UPDATE tasks SET content=%s, category=%s, deadline=%s WHERE id=%s", (content, category, db_date, task_id))
+                cur.execute("UPDATE tasks SET content=%s, category=%s, deadline=%s, description=%s WHERE id=%s", 
+                           (content, category, db_date, description, task_id))
             conn.commit()
         finally:
             conn.close()
@@ -238,10 +247,10 @@ class TaskManager:
                 if sub_categories:
                     placeholders = '%s,' * len(sub_categories)
                     placeholders = placeholders[:-1]
-                    query = f"SELECT id, content, category, deadline, completed FROM tasks WHERE category IN ({placeholders}) ORDER BY deadline ASC"
+                    query = f"SELECT id, content, category, deadline, completed, description FROM tasks WHERE category IN ({placeholders}) ORDER BY deadline ASC"
                     cur.execute(query, tuple(sub_categories))
                 else:
-                    cur.execute("SELECT id, content, category, deadline, completed FROM tasks ORDER BY deadline ASC")
+                    cur.execute("SELECT id, content, category, deadline, completed, description FROM tasks ORDER BY deadline ASC")
                 
                 all_tasks = cur.fetchall()
             
@@ -348,6 +357,7 @@ def main(page: ft.Page):
         tabs_control.selected_index = found_index
         tabs_control.update()
 
+    # --- PÄÄNÄKYMÄN RENDERÖINTI (KORJATTU SILMUKKA) ---
     def render_tasks(tab_name="Kaikki"):
         tasks_column.controls.clear()
         tasks = []
@@ -378,10 +388,15 @@ def main(page: ft.Page):
             ))
         
         for t in tasks:
-            t_id, t_content, t_cat, t_deadline_db, t_completed = t[0], t[1], t[2], t[3], t[4]
+            t_id = t[0]
+            t_content = t[1]
+            t_cat = t[2]
+            t_deadline_db = t[3]
+            t_completed = t[4]
+            t_desc = t[5] if t[5] else ""
+            
             display_date = date_db_to_fi(t_deadline_db)
             cat_color = get_cat_color(t_cat)
-            
             decor = ft.TextDecoration.LINE_THROUGH if t_completed else ft.TextDecoration.NONE
             opacity = 0.6 if t_completed else 1.0
             bg_color = "#EAE0B0" if t_completed else COLOR_CARD
@@ -389,18 +404,58 @@ def main(page: ft.Page):
             delete_btn = ft.IconButton(icon=ft.Icons.DELETE_OUTLINE, icon_color=COLOR_DELETE, on_click=lambda e, x=t_id: delete_task_click(x))
             edit_btn = ft.IconButton(icon=ft.Icons.EDIT, icon_color=COLOR_PRIMARY, on_click=lambda e, x=t: open_edit_dialog(x))
 
-            tasks_column.controls.append(ft.Container(
-                content=ft.Row([
-                    ft.Container(width=10, bgcolor=cat_color, border_radius=ft.border_radius.only(top_left=10, bottom_left=10)),
-                    ft.Checkbox(value=bool(t_completed), fill_color=COLOR_PRIMARY, on_change=lambda e, x=t_id, y=t_completed: toggle_status(x, y)),
-                    ft.Column([
-                        ft.Text(t_content, style=ft.TextStyle(decoration=decor, color=COLOR_TEXT, size=14, weight=ft.FontWeight.BOLD)),
+            # --- LAAJENEVA SISÄLTÖ ---
+            desc_text = ft.Text(
+                t_desc if t_desc else "Ei lisätietoja.", 
+                size=12, 
+                color=COLOR_DESC, 
+                visible=False,
+                italic=True
+            )
+            
+            info_icon = ft.Icon(ft.Icons.INFO_OUTLINE, size=16, color=COLOR_PRIMARY, visible=bool(t_desc))
+
+            # KORJAUS: Sidotaan 'd' tähän nimenomaiseen desc_text -elementtiin
+            def toggle_details(e, d=desc_text):
+                d.visible = not d.visible
+                page.update()
+
+            main_row = ft.Row([
+                ft.Container(width=10, bgcolor=cat_color, border_radius=ft.border_radius.only(top_left=10, bottom_left=10)),
+                ft.Checkbox(value=bool(t_completed), fill_color=COLOR_PRIMARY, on_change=lambda e, x=t_id, y=t_completed: toggle_status(x, y)),
+                
+                ft.Container(
+                    content=ft.Column([
+                        ft.Row([ft.Text(t_content, style=ft.TextStyle(decoration=decor, color=COLOR_TEXT, size=14, weight=ft.FontWeight.BOLD)), info_icon]),
                         ft.Text(f"{t_cat} | {display_date}", size=10, color=COLOR_TEXT),
-                    ], expand=True),
-                    edit_btn, delete_btn
-                ]),
-                bgcolor=bg_color, height=70, border_radius=10, opacity=opacity, shadow=ft.BoxShadow(blur_radius=2, color="#33000000"), animate=300
-            ))
+                    ], spacing=2),
+                    expand=True,
+                    on_click=toggle_details 
+                ),
+                
+                edit_btn, 
+                delete_btn
+            ], alignment=ft.MainAxisAlignment.START, vertical_alignment=ft.CrossAxisAlignment.START)
+
+            task_card_content = ft.Column([
+                main_row,
+                ft.Container(
+                    content=desc_text, 
+                    padding=ft.padding.only(left=50, right=10, bottom=10)
+                )
+            ], spacing=0)
+
+            container = ft.Container(
+                content=task_card_content,
+                bgcolor=bg_color,
+                border_radius=10,
+                opacity=opacity,
+                shadow=ft.BoxShadow(blur_radius=2, color="#33000000"),
+                animate_size=300,
+                padding=ft.padding.only(bottom=5)
+            )
+            
+            tasks_column.controls.append(container)
         page.update()
 
     def refresh_main_view():
@@ -411,9 +466,9 @@ def main(page: ft.Page):
              current_tab_text = tabs_control.tabs[tabs_control.selected_index].text
         render_tasks(current_tab_text)
 
-    # --- DIALOGIT ---
-    
+    # --- TASK DIALOG ---
     new_task_name = ft.TextField(label="Tehtävä", border_color=COLOR_PRIMARY, color=COLOR_TEXT, expand=True)
+    new_task_desc = ft.TextField(label="Lisätiedot / Ohjeet", border_color=COLOR_PRIMARY, color=COLOR_TEXT, multiline=True, min_lines=2, max_lines=5)
     new_task_cat_dropdown = ft.Dropdown(label="Kategoria", border_color=COLOR_PRIMARY, color=COLOR_TEXT, width=200)
     date_input = ft.TextField(label="Pvm", value=datetime.now().strftime("%d.%m.%Y"), border_color=COLOR_PRIMARY, color=COLOR_TEXT, width=150)
     date_picker = ft.DatePicker(on_change=lambda e: (setattr(date_input, 'value', date_picker.value.strftime("%d.%m.%Y")), date_input.update()) if date_picker.value else None)
@@ -422,14 +477,19 @@ def main(page: ft.Page):
     add_dialog = ft.AlertDialog(
         title=ft.Text("Tehtävä", color=COLOR_TEXT),
         bgcolor=COLOR_BG,
-        content=ft.Column([new_task_name, new_task_cat_dropdown, ft.Row([date_input, calendar_btn], alignment=ft.MainAxisAlignment.SPACE_BETWEEN)], height=200, width=320),
+        content=ft.Column([
+            new_task_name, 
+            new_task_desc,
+            new_task_cat_dropdown, 
+            ft.Row([date_input, calendar_btn], alignment=ft.MainAxisAlignment.SPACE_BETWEEN)
+        ], height=300, width=320),
         actions=[
             ft.TextButton(content=ft.Text("Peruuta", color=COLOR_TEXT), on_click=lambda e: page.close(add_dialog)),
             ft.ElevatedButton(content=ft.Text("Tallenna", color=COLOR_BG), bgcolor=COLOR_PRIMARY, on_click=lambda e: save_task(e))
         ]
     )
 
-    # --- ASETUKSET UI (PÄIVITETTY) ---
+    # --- ASETUKSET UI ---
     settings_tabs = ft.Tabs(
         selected_index=0,
         tabs=[ft.Tab(text="Kategoriat"), ft.Tab(text="Pääkategoriat (Niput)")],
@@ -441,7 +501,7 @@ def main(page: ft.Page):
     cat_edit_name = ft.TextField(label="Nimi", border_color=COLOR_PRIMARY, color=COLOR_TEXT)
     cat_edit_color = ft.Dropdown(label="Väri", border_color=COLOR_PRIMARY, options=[ft.dropdown.Option(k) for k in AVAILABLE_COLORS.keys()])
     cat_edit_icon = ft.Dropdown(label="Ikoni", border_color=COLOR_PRIMARY, options=[ft.dropdown.Option(k) for k in AVAILABLE_ICONS.keys()])
-    cat_icon_preview = ft.Icon(ft.Icons.CIRCLE, color=COLOR_PRIMARY, size=30) # Esikatselu
+    cat_icon_preview = ft.Icon(ft.Icons.CIRCLE, color=COLOR_PRIMARY, size=30)
     
     def update_cat_icon_preview(e):
         icon_key = cat_edit_icon.value
@@ -456,7 +516,7 @@ def main(page: ft.Page):
     # MASTER CATEGORY UI
     master_edit_name = ft.TextField(label="Nipun nimi", border_color=COLOR_PRIMARY, color=COLOR_TEXT)
     master_edit_icon = ft.Dropdown(label="Ikoni", border_color=COLOR_PRIMARY, options=[ft.dropdown.Option(k) for k in AVAILABLE_ICONS.keys()])
-    master_icon_preview = ft.Icon(ft.Icons.FOLDER, color=COLOR_PRIMARY, size=30) # Esikatselu
+    master_icon_preview = ft.Icon(ft.Icons.FOLDER, color=COLOR_PRIMARY, size=30) 
 
     def update_master_icon_preview(e):
         icon_key = master_edit_icon.value
@@ -468,7 +528,6 @@ def main(page: ft.Page):
 
     settings_content = ft.Column([
         settings_tabs,
-        # KATEGORIA NÄKYMÄ
         ft.Container(
             content=ft.Column([
                 ft.Text("Lisää/Muokkaa Kategoriaa:", size=12, color=COLOR_TEXT),
@@ -481,7 +540,6 @@ def main(page: ft.Page):
             ]),
             visible=True
         ),
-        # PÄÄKATEGORIA NÄKYMÄ
         ft.Container(
             content=ft.Column([
                 ft.Text("Lisää/Muokkaa Nippua:", size=12, color=COLOR_TEXT),
@@ -510,14 +568,16 @@ def main(page: ft.Page):
         actions=[ft.TextButton(content=ft.Text("Sulje", color=COLOR_TEXT), on_click=lambda e: close_settings(e))]
     )
 
+    # --- TOIMINNOT ---
+
     def save_task(e):
         if not new_task_name.value: return
         try:
             if editing_task_id.current:
-                db.update_task(editing_task_id.current, new_task_name.value, new_task_cat_dropdown.value, date_input.value)
+                db.update_task(editing_task_id.current, new_task_name.value, new_task_cat_dropdown.value, date_input.value, new_task_desc.value)
                 msg = "Päivitetty!"
             else:
-                db.add_task(new_task_name.value, new_task_cat_dropdown.value, date_input.value)
+                db.add_task(new_task_name.value, new_task_cat_dropdown.value, date_input.value, new_task_desc.value)
                 msg = "Luotu!"
             page.close(add_dialog)
             refresh_main_view()
@@ -540,6 +600,7 @@ def main(page: ft.Page):
     def open_new_dialog(e):
         editing_task_id.current = None
         new_task_name.value = ""
+        new_task_desc.value = "" 
         date_input.value = datetime.now().strftime("%d.%m.%Y")
         opts = [ft.dropdown.Option(c[1]) for c in current_categories]
         new_task_cat_dropdown.options = opts
@@ -550,6 +611,8 @@ def main(page: ft.Page):
     def open_edit_dialog(t):
         editing_task_id.current = t[0]
         new_task_name.value = t[1]
+        new_task_desc.value = t[5] if t[5] else "" 
+        
         opts = [ft.dropdown.Option(c[1]) for c in current_categories]
         new_task_cat_dropdown.options = opts
         new_task_cat_dropdown.value = t[2]
@@ -582,7 +645,7 @@ def main(page: ft.Page):
                     ft.IconButton(icon=ft.Icons.DELETE, icon_color=COLOR_DELETE, on_click=lambda e, x=m_id: delete_master(x))
                 ]),
                 bgcolor="#FFFFFF", padding=5, border_radius=5,
-                on_click=lambda e, x=m: prefill_master_form(x) # Nyt myös nipuilla on edit-toiminto
+                on_click=lambda e, x=m: prefill_master_form(x)
             )
             masters_list_view.controls.append(row)
 
@@ -601,25 +664,16 @@ def main(page: ft.Page):
         found_color = next((k for k, v in AVAILABLE_COLORS.items() if v == cat_data[2]), None)
         cat_edit_color.value = found_color
         cat_edit_icon.value = cat_data[3]
-        
-        # Päivitetään esikatselu
         cat_icon_preview.name = AVAILABLE_ICONS.get(cat_data[3], ft.Icons.CIRCLE)
-        
         m_id = cat_data[4]
         cat_edit_master.value = m_id if m_id else "NULL"
-        
         settings_dialog.update()
 
     def prefill_master_form(master_data):
-        # master_data = (id, name, color, icon_name)
         master_edit_name.value = master_data[1]
-        master_edit_name.data = master_data[0] # Tallennetaan ID dataan (editointia varten)
-        
+        master_edit_name.data = master_data[0] 
         master_edit_icon.value = master_data[3]
-        
-        # Päivitetään esikatselu
         master_icon_preview.name = AVAILABLE_ICONS.get(master_data[3], ft.Icons.FOLDER)
-        
         settings_dialog.update()
 
     def save_category(e):
@@ -647,7 +701,6 @@ def main(page: ft.Page):
         if not master_edit_name.value: return
         icon_name = master_edit_icon.value or "Kansio"
         try:
-            # Tarkistetaan ollaanko päivittämässä vai luomassa uutta
             if hasattr(master_edit_name, 'data') and master_edit_name.data:
                 db.update_master_category(master_edit_name.data, master_edit_name.value, "None", icon_name)
                 master_edit_name.data = None
